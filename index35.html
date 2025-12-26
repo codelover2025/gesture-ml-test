@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>StarQuestsx AR Cat Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
+<style>
+    body,html{
+        margin:0; padding:0; overflow:hidden; background:black; touch-action:none;
+    }
+    #start-ar{
+        position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+        padding:14px 28px; border-radius:14px;
+        background:#2196f3; color:white; font-size:20px; border:none; z-index:9999;
+    }
+    canvas{
+        position:fixed; top:0; left:0; width:100%; height:100%; z-index:-1;
+    }
+</style>
+</head>
+<body>
+<button id="start-ar">START AR</button>
+<script>
+let xrSession=null, gl=null, refSpace=null, hitTestSource=null;
+let cubeProgram=null, cubeVBO=null;
+
+// WORLD RED CUBE
+let worldCubeMatrix = new Float32Array(16);
+let worldCubePlaced = false;
+let redCubeExcited = false;
+let redCubeOriginalPos = {x:0, y:0, z:-1.5};
+let lastExcitedTime = 0;
+
+// CAMERA ORIENTATION
+let quat={x:0,y:0,z:0,w:1};
+
+// SPHERE COLLIDER RADIUS
+const SPHERE_RADIUS = 0.25;
+
+// ---------------------- GESTURE CONSTANTS --------------------------
+const GESTURE_WINDOW = 45; // ~30-50 frames window
+const MIN_GESTURE_FRAMES = 18;
+const MOTION_ENERGY_THRESHOLD = 0.08; // tuned to ignore hand jitter
+const INFERENCE_COOLDOWN_MS = 700;
+const GESTURE_CONFIDENCE = 0.78;
+const GESTURE_LABELS = ["poke", "slash", "circle", "bow"];
+
+let gestureBuffer = [];
+let lastInferenceTime = 0;
+let gestureModel = null;
+let lastGestureName = null;
+
+// ---------------------- ORIENTATION --------------------------
+function quatNormalize(q){
+    let l=Math.hypot(q.x,q.y,q.z,q.w);
+    return {x:q.x/l,y:q.y/l,z:q.z/l,w:q.w/l};
+}
+window.addEventListener("deviceorientation", e=>{
+    let yaw=(e.alpha||0)*Math.PI/180;
+    let pitch=(e.beta||0)*Math.PI/180;
+    let roll=(e.gamma||0)*Math.PI/180;
+
+    let cy=Math.cos(yaw*0.5), sy=Math.sin(yaw*0.5);
+    let cp=Math.cos(pitch*0.5), sp=Math.sin(pitch*0.5);
+    let cr=Math.cos(roll*0.5), sr=Math.sin(roll*0.5);
+
+    quat = quatNormalize({
+        w: cr*cp*cy + sr*sp*sy,
+        x: sr*cp*cy - cr*sp*sy,
+        y: cr*sp*cy + sr*cp*sy,
+        z: cr*cp*sy - sr*sp*cy
+    });
+});
+function quatToMatrix(q){
+    return new Float32Array([
+        1-2*(q.y*q.y+q.z*q.z), 2*(q.x*q.y-q.z*q.w),     2*(q.x*q.z+q.y*q.w),     0,
+        2*(q.x*q.y+q.z*q.w),   1-2*(q.x*q.x+q.z*q.z),   2*(q.y*q.z-q.x*q.w),     0,
+        2*(q.x*q.z-q.y*q.w),   2*(q.y*q.z+q.x*q.w),     1-2*(q.x*q.x+q.y*q.y),   0,
+        0,0,0,1
+    ]);
+}
+function identity(){
+    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+// ---------------------- SHADERS --------------------------
+function createShader(gl,type,src){
+    const s=gl.createShader(type);
+    gl.shaderSource(s,src);
+    gl.compileShader(s);
+    return s;
+}
+function initPrograms(gl){
+    const vs=createShader(gl,gl.VERTEX_SHADER,`
+        attribute vec3 pos;
+        uniform mat4 proj, view, model;
+        void main(){
+            gl_Position = proj * view * model * vec4(pos,1.0);
+        }
+    `);
+    const fs=createShader(gl,gl.FRAGMENT_SHADER,`
+        precision mediump float;
+        uniform vec4 color;
+        void main(){
+            gl_FragColor = color;
+        }
+    `);
+
+    cubeProgram=gl.createProgram();
+    gl.attachShader(cubeProgram,vs);
+    gl.attachShader(cubeProgram,fs);
+    gl.linkProgram(cubeProgram);
+
+    const verts=new Float32Array([
+        -0.1,-0.1, 0.1,   0.1,-0.1, 0.1,   0.1, 0.1, 0.1,
+        -0.1,-0.1, 0.1,   0.1, 0.1, 0.1,  -0.1, 0.1, 0.1,
+        -0.1,-0.1,-0.1,  -0.1, 0.1,-0.1,   0.1, 0.1,-0.1,
+        -0.1,-0.1,-0.1,   0.1, 0.1,-0.1,   0.1,-0.1,-0.1,
+        -0.1,-0.1,-0.1,  -0.1,-0.1,0.1,   -0.1, 0.1,0.1,
+        -0.1,-0.1,-0.1,  -0.1, 0.1,0.1,   -0.1, 0.1,-0.1,
+         0.1,-0.1,-0.1,   0.1, 0.1,-0.1,   0.1, 0.1,0.1,
+         0.1,-0.1,-0.1,   0.1, 0.1,0.1,    0.1,-0.1,0.1,
+        -0.1, 0.1,-0.1,  -0.1, 0.1,0.1,    0.1, 0.1,0.1,
+        -0.1, 0.1,-0.1,   0.1, 0.1,0.1,    0.1, 0.1,-0.1,
+        -0.1,-0.1,-0.1,   0.1,-0.1,-0.1,   0.1,-0.1,0.1,
+        -0.1,-0.1,-0.1,   0.1,-0.1,0.1,   -0.1,-0.1,0.1
+    ]);
+    cubeVBO=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,cubeVBO);
+    gl.bufferData(gl.ARRAY_BUFFER,verts,gl.STATIC_DRAW);
+}
+
+// ---------------------- AUDIO --------------------------
+let catSound=null;
+let catBG=null;
+function initAudio(){
+    catSound = new Audio("https://www.noasys.io/tensorflow/cat.mp3");
+    catSound.loop=true;
+    catBG = new Audio("https://www.noasys.io/tensorflow/catBG.mp3");
+    catBG.loop=true;
+    catBG.volume=1.0;
+    catBG.play();
+}
+
+// ---------------------- GESTURE PIPELINE --------------------------
+function pushGestureSample(x,y,z,timeMs){
+    gestureBuffer.push({x,y,z,time:timeMs});
+    if(gestureBuffer.length>GESTURE_WINDOW){
+        gestureBuffer.shift();
+    }
+}
+
+function computeMotionEnergy(buffer){
+    if(buffer.length<2) return 0;
+    let energy=0;
+    for(let i=1;i<buffer.length;i++){
+        const a=buffer[i-1], b=buffer[i];
+        const dx=b.x-a.x, dy=b.y-a.y, dz=b.z-a.z;
+        energy += Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    return energy;
+}
+
+function extractGestureFeatures(buffer){
+    const window = buffer.slice(-GESTURE_WINDOW);
+    const first = window[0];
+    const rel = [];
+    let path = 0;
+    for(let i=0;i<window.length;i++){
+        const p=window[i];
+        if(i>0){
+            const prev=window[i-1];
+            const dx=p.x-prev.x, dy=p.y-prev.y, dz=p.z-prev.z;
+            path += Math.sqrt(dx*dx+dy*dy+dz*dz);
+        }
+        rel.push([p.x-first.x, p.y-first.y, p.z-first.z]);
+    }
+    const scale = Math.max(0.001, path);
+    for(let i=0;i<rel.length;i++){
+        rel[i][0]/=scale;
+        rel[i][1]/=scale;
+        rel[i][2]/=scale;
+    }
+    return tf.tensor3d([rel]);
+}
+
+async function ensureGestureModel(){
+    if(gestureModel) return;
+    await tf.ready();
+    gestureModel = tf.sequential({
+        layers:[
+            tf.layers.gru({
+                units:16,
+                inputShape:[GESTURE_WINDOW,3],
+                returnSequences:false,
+                recurrentActivation:"sigmoid"
+            }),
+            tf.layers.dense({units:GESTURE_LABELS.length, activation:"softmax"})
+        ]
+    });
+    gestureModel.compile({optimizer:"adam", loss:"categoricalCrossentropy"});
+    // warmup so the first inference is smooth
+    tf.tidy(()=>gestureModel.predict(tf.zeros([1,GESTURE_WINDOW,3])));
+}
+
+function onGestureDetected(name){
+    console.log("Gesture detected:",name);
+    // Light integration with existing AR interaction: reuse excitement loop
+    redCubeExcited = true;
+    lastExcitedTime = performance.now();
+    if(catSound && catSound.paused){catSound.play();}
+    navigator.vibrate([60,40,60]);
+}
+
+async function maybeClassifyGesture(){
+    const now = performance.now();
+    if(now - lastInferenceTime < INFERENCE_COOLDOWN_MS) return;
+    if(gestureBuffer.length < MIN_GESTURE_FRAMES) return;
+    const energy = computeMotionEnergy(gestureBuffer);
+    if(energy < MOTION_ENERGY_THRESHOLD) return;
+
+    await ensureGestureModel();
+    lastInferenceTime = now;
+
+    const input = extractGestureFeatures(gestureBuffer);
+    const logits = gestureModel.predict(input);
+    const probs = await logits.data();
+    input.dispose();
+    logits.dispose();
+
+    let bestIdx=0, bestVal=0;
+    for(let i=0;i<probs.length;i++){
+        if(probs[i]>bestVal){bestVal=probs[i]; bestIdx=i;}
+    }
+    const gestureName = GESTURE_LABELS[bestIdx];
+    if(bestVal >= GESTURE_CONFIDENCE && gestureName !== lastGestureName){
+        lastGestureName = gestureName;
+        onGestureDetected(gestureName);
+    }
+}
+
+// ---------------------- ENTER AR --------------------------
+document.getElementById("start-ar").onclick = async ()=>{
+    initAudio();
+    xrSession = await navigator.xr.requestSession("immersive-ar",{requiredFeatures:["local","hit-test"]});
+    const canvas=document.createElement("canvas");
+    canvas.width=window.innerWidth;
+    canvas.height=window.innerHeight;
+    canvas.style.position="fixed";
+    canvas.style.top="0";
+    canvas.style.left="0";
+    canvas.style.width="100%";
+    canvas.style.height="100%";
+    canvas.style.zIndex="-1";
+    document.body.appendChild(canvas);
+
+    gl=canvas.getContext("webgl",{xrCompatible:true});
+    await gl.makeXRCompatible();
+    xrSession.updateRenderState({baseLayer:new XRWebGLLayer(xrSession,gl)});
+    refSpace = await xrSession.requestReferenceSpace("local");
+
+    const viewerSpace=await xrSession.requestReferenceSpace("viewer");
+    hitTestSource = await xrSession.requestHitTestSource({space:viewerSpace});
+
+    initPrograms(gl);
+    document.getElementById("start-ar").remove();
+
+    // Immediately place red cube in front of camera
+    worldCubeMatrix = identity();
+    worldCubeMatrix[12] = redCubeOriginalPos.x;
+    worldCubeMatrix[13] = redCubeOriginalPos.y;
+    worldCubeMatrix[14] = redCubeOriginalPos.z;
+    worldCubePlaced = true;
+
+    xrSession.requestAnimationFrame(onXRFrame);
+};
+
+// ---------------------- COLLISION --------------------------
+function sphereCubeCollision(camX,camY,camZ, cubeMatrix){
+    let cx=cubeMatrix[12], cy=cubeMatrix[13], cz=cubeMatrix[14];
+    let dx=camX-cx, dy=camY-cy, dz=camZ-cz;
+    return (dx*dx+dy*dy+dz*dz) <= SPHERE_RADIUS*SPHERE_RADIUS;
+}
+
+// ---------------------- RENDER --------------------------
+function onXRFrame(t,frame){
+    xrSession.requestAnimationFrame(onXRFrame);
+    const pose=frame.getViewerPose(refSpace);
+    if(!pose) return;
+
+    const layer=xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.viewport(0,0,layer.framebufferWidth,layer.framebufferHeight);
+    gl.clearColor(0,0,0,0);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+
+    const view=pose.views[0];
+    const proj=view.projectionMatrix;
+    const viewMat=view.transform.inverse.matrix;
+
+    const camMat = view.transform.matrix;
+    let camX = camMat[12], camY = camMat[13], camZ = camMat[14];
+    const sampleTime = (frame.predictedDisplayTime || t || performance.now());
+    pushGestureSample(camX,camY,camZ,sampleTime);
+    // fire-and-forget to keep render loop smooth
+    maybeClassifyGesture().catch(err=>console.warn("gesture classify err",err));
+
+    gl.useProgram(cubeProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER,cubeVBO);
+    let locPos=gl.getAttribLocation(cubeProgram,"pos");
+    gl.enableVertexAttribArray(locPos);
+    gl.vertexAttribPointer(locPos,3,gl.FLOAT,false,0,0);
+
+    let uProj=gl.getUniformLocation(cubeProgram,"proj");
+    let uView=gl.getUniformLocation(cubeProgram,"view");
+    let uModel=gl.getUniformLocation(cubeProgram,"model");
+    let uColor=gl.getUniformLocation(cubeProgram,"color");
+    gl.uniformMatrix4fv(uProj,false,proj);
+    gl.uniformMatrix4fv(uView,false,viewMat);
+
+    // ---------------- BLUE SPHERE ----------------
+    let sphere = identity();
+    sphere.set(quatToMatrix(quat));
+    sphere[12] = camX;
+    sphere[13] = camY;
+    sphere[14] = camZ;
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    gl.uniformMatrix4fv(uModel,false,sphere);
+    gl.uniform4fv(uColor,new Float32Array([0,0,1,0])); // fully invisible
+    gl.drawArrays(gl.TRIANGLES,0,36);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+
+    // ---------------- RED CUBE ----------------
+    if(worldCubePlaced){
+        const now = performance.now();
+
+        // Collision detection
+        if(sphereCubeCollision(camX,camY,camZ,worldCubeMatrix)){
+            redCubeExcited = true;
+            lastExcitedTime = now;
+            if(catSound.paused){catSound.play();}
+            navigator.vibrate([150,100,150]);
+        }
+
+        // If excited, move toward camera with random wandering
+        if(redCubeExcited){
+            let targetX = camX + (Math.random()-0.5)*0.5;
+            let targetZ = camZ + (Math.random()-0.5)*0.5;
+            worldCubeMatrix[12] = lerp(worldCubeMatrix[12], targetX, 0.02);
+            worldCubeMatrix[14] = lerp(worldCubeMatrix[14], targetZ, 0.02);
+
+            // Check if 10s passed without new collision, stop being excited
+            if(now - lastExcitedTime > 10000){
+                redCubeExcited = false;
+            }
+        } else {
+            // Smoothly return to original position
+            worldCubeMatrix[12] = lerp(worldCubeMatrix[12], redCubeOriginalPos.x, 0.02);
+            worldCubeMatrix[13] = lerp(worldCubeMatrix[13], redCubeOriginalPos.y, 0.02);
+            worldCubeMatrix[14] = lerp(worldCubeMatrix[14], redCubeOriginalPos.z, 0.02);
+        }
+
+        gl.uniformMatrix4fv(uModel,false,worldCubeMatrix);
+        gl.uniform4fv(uColor,new Float32Array([1.0,0.2,0.2,0.9])); // red
+        gl.drawArrays(gl.TRIANGLES,0,36);
+
+        // update catBG volume by distance
+        let dx2=camX-worldCubeMatrix[12], dy2=camY-worldCubeMatrix[13], dz2=camZ-worldCubeMatrix[14];
+        let dist = Math.sqrt(dx2*dx2+dy2*dy2+dz2*dz2);
+        let vol = Math.max(0.05,Math.min(1.0,1.0 - dist/15));
+        catBG.volume = vol;
+    }
+}
+</script>
+</body>
+</html>
