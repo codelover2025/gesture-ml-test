@@ -1,0 +1,1171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>StarQuestsx AR Cat Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
+<style>
+    body,html{
+        margin:0; padding:0; overflow:hidden; background:black; touch-action:none;
+    }
+    #start-ar{
+        position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+        padding:14px 28px; border-radius:14px;
+        background:#2196f3; color:white; font-size:20px; border:none; z-index:9999;
+    }
+    canvas{
+        position:fixed; top:0; left:0; width:100%; height:100%; z-index:-1;
+    }
+    #ui-overlay{
+        position:fixed; top:10px; left:10px; right:10px;
+        background:rgba(0,0,0,0.85); color:white; padding:15px;
+        border-radius:10px; font-family:Arial; font-size:14px;
+        z-index:10000; max-height:80vh; overflow-y:auto;
+        display:none;
+    }
+    #ui-overlay.visible{ display:block; }
+    #ui-toggle{
+        position:fixed; top:10px; right:10px; z-index:10001;
+        padding:10px 15px; background:#2196f3; color:white;
+        border:none; border-radius:8px; font-size:16px;
+    }
+    .ui-section{ margin:15px 0; padding:10px; background:rgba(255,255,255,0.05); border-radius:6px; }
+    .ui-section h3{ margin:0 0 10px 0; font-size:16px; }
+    button.ui-btn{
+        padding:8px 12px; margin:5px; background:#4CAF50; color:white;
+        border:none; border-radius:6px; font-size:14px; cursor:pointer;
+    }
+    button.ui-btn:active{ background:#45a049; }
+    button.ui-btn.recording{ background:#f44336; }
+    select.ui-select{ padding:8px; margin:5px; border-radius:6px; font-size:14px; }
+    #gesture-feedback{
+        background:rgba(255,255,255,0.1); padding:10px; border-radius:6px;
+        margin-top:10px; min-height:60px;
+    }
+    #gesture-feedback .gesture-name{
+        font-size:24px; font-weight:bold; color:#4CAF50; text-align:center;
+        margin:5px 0;
+    }
+    #gesture-feedback .gesture-info{
+        font-size:12px; color:#ccc; margin:3px 0;
+    }
+    #confidence-bar{
+        width:100%; height:20px; background:#333; border-radius:10px;
+        margin:10px 0; overflow:hidden;
+    }
+    #confidence-fill{
+        height:100%; background:linear-gradient(90deg, #f44336, #ff9800, #4CAF50);
+        transition:width 0.3s; width:0%;
+    }
+    input[type="file"]{ display:none; }
+</style>
+</head>
+<body>
+<button id="start-ar">START AR</button>
+<button id="ui-toggle" style="display:none;">☰ UI</button>
+
+<div id="ui-overlay">
+    <div class="ui-section">
+        <h3>Gesture Detection</h3>
+        <div id="gesture-feedback">
+            <div class="gesture-name">None</div>
+            <div class="gesture-info">Motion Energy: 0.000</div>
+            <div class="gesture-info">Confidence: 0%</div>
+            <div id="confidence-bar"><div id="confidence-fill"></div></div>
+        </div>
+    </div>
+    
+    <div class="ui-section">
+        <h3>Record Gesture</h3>
+        <select id="gesture-select" class="ui-select">
+            <option value="poke">Poke</option>
+            <option value="slash">Slash</option>
+            <option value="circle">Circle</option>
+            <option value="bow">Bow</option>
+        </select>
+        <button id="record-btn" class="ui-btn">Record</button>
+        <div id="record-status" style="margin-top:5px; font-size:12px; color:#ccc;"></div>
+    </div>
+    
+    <div class="ui-section">
+        <h3>Dataset</h3>
+        <button id="save-dataset-btn" class="ui-btn">Download Dataset</button>
+        <button id="load-dataset-btn" class="ui-btn">Upload Dataset</button>
+        <input type="file" id="dataset-input" accept=".json">
+    </div>
+    
+    <div class="ui-section">
+        <h3>Model</h3>
+        <button id="train-btn" class="ui-btn">Train Model</button>
+        <button id="save-model-btn" class="ui-btn">Download Model</button>
+        <button id="load-model-btn" class="ui-btn">Upload Model</button>
+        <input type="file" id="model-input" webkitdirectory directory>
+        <div id="model-status" style="margin-top:5px; font-size:12px; color:#ccc;"></div>
+    </div>
+</div>
+
+<script>
+let xrSession=null, gl=null, refSpace=null, hitTestSource=null;
+let cubeProgram=null, cubeVBO=null;
+
+// WORLD RED CUBE
+let worldCubeMatrix = new Float32Array(16);
+let worldCubePlaced = false;
+let redCubeExcited = false;
+let redCubeOriginalPos = {x:0, y:0, z:-1.5};
+let lastExcitedTime = 0;
+
+// CAMERA ORIENTATION
+let quat={x:0,y:0,z:0,w:1};
+
+// SPHERE COLLIDER RADIUS
+const SPHERE_RADIUS = 0.25;
+
+// ---------------------- GESTURE CONSTANTS --------------------------
+const GESTURE_WINDOW = 45; // ~30-50 frames window
+const MIN_GESTURE_FRAMES = 25; // increased from 18
+const MOTION_ENERGY_THRESHOLD = 0.25; // MUCH higher - was 0.08, now requires significant motion
+const INFERENCE_COOLDOWN_MS = 180; // min time between classification attempts
+const DETECTION_COOLDOWN_MS = 700; // cooldown after successful gesture
+const GESTURE_CONFIDENCE = 0.78;   // ON threshold
+const GESTURE_CONFIDENCE_OFF = 0.6; // OFF threshold (hysteresis)
+const STABLE_HIT_FRAMES = 3;       // require MORE stable hits - was 2, now 3
+const GESTURE_LABELS = ["poke", "slash", "circle", "bow"];
+
+// ---------------------- INTENT GATE CONSTANTS (REJECTION-FIRST) --------------------------
+const MIN_PEAK_VELOCITY = 2.0;      // m/s - reject slow motion
+const MIN_AVG_VELOCITY = 1.2;       // m/s - reject low average velocity
+const MIN_ACCELERATION_SPIKE = 8.0; // m/s² - reject smooth drift
+const MIN_ACCEL_VARIANCE = 15.0;    // m²/s⁴ - reject low acceleration variance (too smooth)
+const MIN_TOTAL_DISPLACEMENT = 0.30; // meters - require significant movement
+const MAX_MOTION_DURATION_MS = 2000; // ms - reject motions that are too long (camera repositioning)
+const MIN_SHARP_PEAK_RATIO = 0.5;   // peak must be at least 50% higher than average
+const PEAK_DECAY_RATIO = 0.4;       // peak must decay to at least 40% of max
+const MAX_IDLE_VARIANCE = 0.05;     // m² - reject if motion variance is too low (idle/camera drift)
+
+// ---------------------- POKE GESTURE CONSTANTS (STRICT) --------------------------
+const POKE_MIN_PEAK_VELOCITY = 3.5;        // m/s - strict threshold for fast strike
+const POKE_MIN_FORWARD_ACCEL_SPIKE = 12.0; // m/s² - require strong forward acceleration spike
+const POKE_MAX_DURATION_MS = 800;          // ms - must be fast in, fast out (short duration)
+const POKE_MIN_ACCEL_TO_VEL_RATIO = 3.0;   // acceleration spike must be much higher than velocity (sharp strike)
+const POKE_MAX_STEADY_VELOCITY = 1.5;      // m/s - reject if velocity is too steady (slow movement)
+
+let gestureBuffer = [];
+let lastInferenceTime = 0;
+let lastDetectionTime = 0;
+let gestureModel = null;
+let lastGestureName = null;
+let stableGestureName = null;
+let stableGestureFrames = 0;
+let stableGestureConfidence = 0;
+
+// ---------------------- ORIENTATION --------------------------
+function quatNormalize(q){
+    let l=Math.hypot(q.x,q.y,q.z,q.w);
+    return {x:q.x/l,y:q.y/l,z:q.z/l,w:q.w/l};
+}
+window.addEventListener("deviceorientation", e=>{
+    let yaw=(e.alpha||0)*Math.PI/180;
+    let pitch=(e.beta||0)*Math.PI/180;
+    let roll=(e.gamma||0)*Math.PI/180;
+
+    let cy=Math.cos(yaw*0.5), sy=Math.sin(yaw*0.5);
+    let cp=Math.cos(pitch*0.5), sp=Math.sin(pitch*0.5);
+    let cr=Math.cos(roll*0.5), sr=Math.sin(roll*0.5);
+
+    quat = quatNormalize({
+        w: cr*cp*cy + sr*sp*sy,
+        x: sr*cp*cy - cr*sp*sy,
+        y: cr*sp*cy + sr*cp*sy,
+        z: cr*cp*sy - sr*sp*cy
+    });
+});
+function quatToMatrix(q){
+    return new Float32Array([
+        1-2*(q.y*q.y+q.z*q.z), 2*(q.x*q.y-q.z*q.w),     2*(q.x*q.z+q.y*q.w),     0,
+        2*(q.x*q.y+q.z*q.w),   1-2*(q.x*q.x+q.z*q.z),   2*(q.y*q.z-q.x*q.w),     0,
+        2*(q.x*q.z-q.y*q.w),   2*(q.y*q.z+q.x*q.w),     1-2*(q.x*q.x+q.y*q.y),   0,
+        0,0,0,1
+    ]);
+}
+function identity(){
+    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+// ---------------------- SHADERS --------------------------
+function createShader(gl,type,src){
+    const s=gl.createShader(type);
+    gl.shaderSource(s,src);
+    gl.compileShader(s);
+    return s;
+}
+function initPrograms(gl){
+    const vs=createShader(gl,gl.VERTEX_SHADER,`
+        attribute vec3 pos;
+        uniform mat4 proj, view, model;
+        void main(){
+            gl_Position = proj * view * model * vec4(pos,1.0);
+        }
+    `);
+    const fs=createShader(gl,gl.FRAGMENT_SHADER,`
+        precision mediump float;
+        uniform vec4 color;
+        void main(){
+            gl_FragColor = color;
+        }
+    `);
+
+    cubeProgram=gl.createProgram();
+    gl.attachShader(cubeProgram,vs);
+    gl.attachShader(cubeProgram,fs);
+    gl.linkProgram(cubeProgram);
+
+    const verts=new Float32Array([
+        -0.1,-0.1, 0.1,   0.1,-0.1, 0.1,   0.1, 0.1, 0.1,
+        -0.1,-0.1, 0.1,   0.1, 0.1, 0.1,  -0.1, 0.1, 0.1,
+        -0.1,-0.1,-0.1,  -0.1, 0.1,-0.1,   0.1, 0.1,-0.1,
+        -0.1,-0.1,-0.1,   0.1, 0.1,-0.1,   0.1,-0.1,-0.1,
+        -0.1,-0.1,-0.1,  -0.1,-0.1,0.1,   -0.1, 0.1,0.1,
+        -0.1,-0.1,-0.1,  -0.1, 0.1,0.1,   -0.1, 0.1,-0.1,
+         0.1,-0.1,-0.1,   0.1, 0.1,-0.1,   0.1, 0.1,0.1,
+         0.1,-0.1,-0.1,   0.1, 0.1,0.1,    0.1,-0.1,0.1,
+        -0.1, 0.1,-0.1,  -0.1, 0.1,0.1,    0.1, 0.1,0.1,
+        -0.1, 0.1,-0.1,   0.1, 0.1,0.1,    0.1, 0.1,-0.1,
+        -0.1,-0.1,-0.1,   0.1,-0.1,-0.1,   0.1,-0.1,0.1,
+        -0.1,-0.1,-0.1,   0.1,-0.1,0.1,   -0.1,-0.1,0.1
+    ]);
+    cubeVBO=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,cubeVBO);
+    gl.bufferData(gl.ARRAY_BUFFER,verts,gl.STATIC_DRAW);
+}
+
+// ---------------------- AUDIO --------------------------
+let catSound=null;
+let catBG=null;
+function initAudio(){
+    catSound = new Audio("https://www.noasys.io/tensorflow/cat.mp3");
+    catSound.loop=true;
+    catBG = new Audio("https://www.noasys.io/tensorflow/catBG.mp3");
+    catBG.loop=true;
+    catBG.volume=1.0;
+    catBG.play();
+}
+
+// ---------------------- GESTURE PIPELINE --------------------------
+let useHeuristicDetection = true; // works immediately, ML optional
+let trainingData = {poke:[], slash:[], circle:[], bow:[]};
+let isRecording = null;
+
+function pushGestureSample(x,y,z,timeMs){
+    gestureBuffer.push({x,y,z,time:timeMs});
+    if(gestureBuffer.length>GESTURE_WINDOW){
+        gestureBuffer.shift();
+    }
+}
+
+function computeMotionEnergy(buffer){
+    if(buffer.length<2) return 0;
+    let energy=0;
+    for(let i=1;i<buffer.length;i++){
+        const a=buffer[i-1], b=buffer[i];
+        const dx=b.x-a.x, dy=b.y-a.y, dz=b.z-a.z;
+        energy += Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    return energy;
+}
+
+// ---------------------- GLOBAL INTENT GATE (REJECTION-FIRST) --------------------------
+function checkUserIntent(buffer){
+    // REJECTION-FIRST: Explicitly reject non-intentional motion before any detection
+    // Returns false immediately if motion doesn't look intentional
+    
+    // REJECT: Insufficient data
+    if(buffer.length < 10) return false;
+    
+    // REJECT: Motion duration too long (camera repositioning, not a gesture)
+    const motionDuration = buffer[buffer.length-1].time - buffer[0].time;
+    if(motionDuration > MAX_MOTION_DURATION_MS) return false;
+    
+    // Calculate velocities and accelerations
+    const velocities = [];
+    const accelerations = [];
+    let maxVelocity = 0;
+    let peakVelocityIdx = -1;
+    let sumVelocity = 0;
+    let validVelocities = 0;
+    
+    for(let i=1; i<buffer.length; i++){
+        const a = buffer[i-1];
+        const b = buffer[i];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const dz = b.z - a.z;
+        const dt = (b.time - a.time) * 0.001; // convert to seconds
+        
+        if(dt > 0){
+            const speed = Math.sqrt(dx*dx + dy*dy + dz*dz) / dt;
+            velocities.push({speed, idx: i});
+            sumVelocity += speed;
+            validVelocities++;
+            if(speed > maxVelocity){
+                maxVelocity = speed;
+                peakVelocityIdx = i;
+            }
+        }
+    }
+    
+    // REJECT: No valid velocity data
+    if(velocities.length === 0 || validVelocities === 0) return false;
+    
+    // REJECT: Average velocity too low (slow motion overall)
+    const avgVelocity = sumVelocity / validVelocities;
+    if(avgVelocity < MIN_AVG_VELOCITY) return false;
+    
+    // REJECT: Peak velocity too low (no fast movement)
+    if(maxVelocity < MIN_PEAK_VELOCITY) return false;
+    
+    // REJECT: Peak not sharp enough (motion too uniform, no clear intent)
+    const peakToAvgRatio = maxVelocity / avgVelocity;
+    if(peakToAvgRatio < (1.0 + MIN_SHARP_PEAK_RATIO)) return false;
+    
+    // Calculate accelerations
+    let maxAcceleration = 0;
+    let sumAccel = 0;
+    let sumAccelSq = 0;
+    let validAccels = 0;
+    
+    for(let i=1; i<velocities.length; i++){
+        const v1 = velocities[i-1].speed;
+        const v2 = velocities[i].speed;
+        const dt = (buffer[velocities[i].idx].time - buffer[velocities[i-1].idx].time) * 0.001;
+        
+        if(dt > 0){
+            const accel = Math.abs(v2 - v1) / dt;
+            accelerations.push(accel);
+            sumAccel += accel;
+            sumAccelSq += accel * accel;
+            validAccels++;
+            if(accel > maxAcceleration){
+                maxAcceleration = accel;
+            }
+        }
+    }
+    
+    // REJECT: No acceleration spike (smooth drift, not intentional)
+    if(maxAcceleration < MIN_ACCELERATION_SPIKE) return false;
+    
+    // REJECT: Acceleration variance too low (too smooth, camera repositioning)
+    if(validAccels > 1){
+        const avgAccel = sumAccel / validAccels;
+        const accelVariance = (sumAccelSq / validAccels) - (avgAccel * avgAccel);
+        if(accelVariance < MIN_ACCEL_VARIANCE) return false;
+    }
+    
+    // Calculate total displacement and motion variance
+    const start = buffer[0];
+    const end = buffer[buffer.length-1];
+    const totalDisp = Math.sqrt(
+        (end.x - start.x)**2 + 
+        (end.y - start.y)**2 + 
+        (end.z - start.z)**2
+    );
+    
+    // REJECT: Total displacement too small
+    if(totalDisp < MIN_TOTAL_DISPLACEMENT) return false;
+    
+    // REJECT: Motion variance too low (idle movement or camera drift)
+    let sumVarX = 0, sumVarY = 0, sumVarZ = 0;
+    const centerX = buffer.reduce((s,p)=>s+p.x,0)/buffer.length;
+    const centerY = buffer.reduce((s,p)=>s+p.y,0)/buffer.length;
+    const centerZ = buffer.reduce((s,p)=>s+p.z,0)/buffer.length;
+    for(let p of buffer){
+        sumVarX += (p.x - centerX)**2;
+        sumVarY += (p.y - centerY)**2;
+        sumVarZ += (p.z - centerZ)**2;
+    }
+    const motionVariance = (sumVarX + sumVarY + sumVarZ) / buffer.length;
+    if(motionVariance < MAX_IDLE_VARIANCE) return false; // too low variance = idle
+    
+    // Check for clear motion peak followed by decay
+    if(peakVelocityIdx < 0) return false;
+    
+    // Find the index in velocities array where peak occurred
+    let peakVelArrayIdx = -1;
+    for(let i = 0; i < velocities.length; i++){
+        if(velocities[i].idx === peakVelocityIdx){
+            peakVelArrayIdx = i;
+            break;
+        }
+    }
+    if(peakVelArrayIdx < 0) return false;
+    
+    // REJECT: Peak too late (no time for decay, motion still ongoing)
+    const peakPositionRatio = peakVelArrayIdx / velocities.length;
+    if(peakPositionRatio > 0.85) return false;
+    
+    // REJECT: No clear decay pattern (motion doesn't slow down after peak)
+    let minSpeedAfterPeak = maxVelocity;
+    for(let i = peakVelArrayIdx; i < velocities.length; i++){
+        if(velocities[i].speed < minSpeedAfterPeak){
+            minSpeedAfterPeak = velocities[i].speed;
+        }
+    }
+    const decayRatio = minSpeedAfterPeak / maxVelocity;
+    if(decayRatio > (1.0 - PEAK_DECAY_RATIO)) return false;
+    
+    // ALL REJECTION CHECKS PASSED - motion shows clear user intent
+    return true;
+}
+
+// ---------------------- HEURISTIC GESTURE DETECTION --------------------------
+function detectPoke(buffer){
+    // REJECTION-FIRST: Explicitly reject non-poke patterns before detection
+    // Poke must be: sharp, fast forward strike with strong acceleration spike and short duration
+    
+    if(buffer.length<15) return 0; // REJECT: insufficient data
+    
+    const end = buffer.length-1;
+    const startZ = buffer[0].z;
+    const endZ = buffer[end].z;
+    const forwardMotion = startZ - endZ; // positive = forward
+    
+    // REJECT: Not moving forward (poke must go forward)
+    if(forwardMotion <= 0.20) return 0;
+    
+    // REJECT: Motion duration too long (poke must be fast in, fast out)
+    const motionDuration = buffer[end].time - buffer[0].time;
+    if(motionDuration > POKE_MAX_DURATION_MS) return 0;
+    
+    // Calculate forward velocities and accelerations
+    const forwardVelocities = [];
+    const forwardAccelerations = [];
+    let maxForwardVel = 0;
+    let maxForwardVelIdx = -1;
+    let sumForwardVel = 0;
+    let velCount = 0;
+    
+    for(let i=1; i<buffer.length; i++){
+        const dz = buffer[i-1].z - buffer[i].z; // positive = forward
+        const dt = (buffer[i].time - buffer[i-1].time) * 0.001; // convert to seconds
+        
+        if(dt > 0 && dz > 0){ // only forward motion
+            const vel = dz / dt;
+            forwardVelocities.push({vel, idx: i, time: buffer[i].time});
+            sumForwardVel += vel;
+            velCount++;
+            if(vel > maxForwardVel){
+                maxForwardVel = vel;
+                maxForwardVelIdx = i;
+            }
+        }
+    }
+    
+    // REJECT: No valid forward velocity data
+    if(velCount === 0 || forwardVelocities.length === 0) return 0;
+    
+    const avgForwardVel = sumForwardVel / velCount;
+    
+    // REJECT: Peak forward velocity too low (not a fast strike)
+    if(maxForwardVel < POKE_MIN_PEAK_VELOCITY) return 0;
+    
+    // REJECT: Velocity too steady (slow, gradual movement - not a sharp strike)
+    // Check if velocity variation is too low (indicates steady movement)
+    let velVariance = 0;
+    for(let v of forwardVelocities){
+        velVariance += (v.vel - avgForwardVel) ** 2;
+    }
+    velVariance /= forwardVelocities.length;
+    const velStdDev = Math.sqrt(velVariance);
+    if(velStdDev < POKE_MAX_STEADY_VELOCITY) return 0; // too steady = slow movement
+    
+    // Calculate forward accelerations
+    let maxForwardAccel = 0;
+    let maxForwardAccelIdx = -1;
+    
+    for(let i=1; i<forwardVelocities.length; i++){
+        const v1 = forwardVelocities[i-1].vel;
+        const v2 = forwardVelocities[i].vel;
+        const dt = (forwardVelocities[i].time - forwardVelocities[i-1].time) * 0.001;
+        
+        if(dt > 0){
+            const accel = (v2 - v1) / dt; // positive = accelerating forward
+            forwardAccelerations.push({accel, idx: i});
+            if(accel > maxForwardAccel){
+                maxForwardAccel = accel;
+                maxForwardAccelIdx = i;
+            }
+        }
+    }
+    
+    // REJECT: No strong forward acceleration spike (not a sharp strike)
+    if(maxForwardAccel < POKE_MIN_FORWARD_ACCEL_SPIKE) return 0;
+    
+    // REJECT: Acceleration spike not strong enough relative to velocity (not sharp enough)
+    // A sharp strike should have acceleration much higher than velocity
+    if(maxForwardAccel / (maxForwardVel + 0.1) < POKE_MIN_ACCEL_TO_VEL_RATIO) return 0;
+    
+    // REJECT: Acceleration spike too late (should happen early in the motion)
+    const accelSpikePosition = maxForwardAccelIdx / forwardAccelerations.length;
+    if(accelSpikePosition > 0.5) return 0; // spike should be in first half
+    
+    // REJECT: Too much lateral motion (poke should be straight forward)
+    const lateralMotion = Math.abs(buffer[end].x-buffer[0].x) + Math.abs(buffer[end].y-buffer[0].y);
+    if(lateralMotion >= 0.08) return 0;
+    
+    // Check for fast in, fast out pattern (velocity should rise quickly then fall)
+    if(maxForwardVelIdx >= 0 && maxForwardVelIdx < forwardVelocities.length){
+        const peakIdx = maxForwardVelIdx;
+        // Check velocity before peak (should rise)
+        let velRise = false;
+        if(peakIdx > 0){
+            const velBeforePeak = forwardVelocities[peakIdx-1].vel;
+            if(maxForwardVel > velBeforePeak * 1.3) velRise = true; // significant rise
+        }
+        
+        // Check velocity after peak (should fall)
+        let velFall = false;
+        if(peakIdx < forwardVelocities.length - 1){
+            const velAfterPeak = forwardVelocities[peakIdx+1].vel;
+            if(velAfterPeak < maxForwardVel * 0.7) velFall = true; // significant fall
+        }
+        
+        // REJECT: No clear fast in, fast out pattern
+        if(!velRise || !velFall) return 0;
+    }
+    
+    // All rejection checks passed - this is a sharp, fast forward strike
+    return 0.9;
+}
+
+function detectSlash(buffer){
+    // REJECTION-FIRST: Explicitly reject non-slash patterns before detection
+    if(buffer.length<25) return 0; // REJECT: insufficient data
+    
+    // Calculate horizontal velocities
+    let maxXVel=0, maxYVel=0;
+    let avgXVel=0, avgYVel=0;
+    let velCount=0;
+    for(let i=1;i<buffer.length;i++){
+        const dx = buffer[i].x - buffer[i-1].x;
+        const dy = buffer[i].y - buffer[i-1].y;
+        const dt = buffer[i].time - buffer[i-1].time;
+        if(dt>0){
+            const xVel = Math.abs(dx)/(dt*0.001);
+            const yVel = Math.abs(dy)/(dt*0.001);
+            if(xVel>maxXVel) maxXVel=xVel;
+            if(yVel>maxYVel) maxYVel=yVel;
+            avgXVel += xVel;
+            avgYVel += yVel;
+            velCount++;
+        }
+    }
+    
+    // REJECT: No valid velocity data
+    if(velCount === 0) return 0;
+    avgXVel /= velCount;
+    avgYVel /= velCount;
+    
+    const horizontalMotion = Math.max(maxXVel, maxYVel);
+    const avgHorizontalMotion = Math.max(avgXVel, avgYVel);
+    
+    // REJECT: Peak horizontal velocity too low (not a fast slash)
+    if(horizontalMotion <= 2.8) return 0;
+    
+    // REJECT: Average horizontal velocity too low (too slow overall)
+    if(avgHorizontalMotion <= 1.5) return 0;
+    
+    // REJECT: Too much forward motion (slash should be horizontal, not forward)
+    const forwardMotion = Math.abs(buffer[buffer.length-1].z - buffer[0].z);
+    if(forwardMotion >= 0.06) return 0;
+    
+    // All rejection checks passed - this looks like a slash
+    return 0.85;
+}
+
+function detectCircle(buffer){
+    // REJECTION-FIRST: Explicitly reject non-circle patterns before detection
+    if(buffer.length<25) return 0; // REJECT: insufficient data
+    
+    // Compute principal motion plane (orientation independent)
+    const centerX = buffer.reduce((s,p)=>s+p.x,0)/buffer.length;
+    const centerY = buffer.reduce((s,p)=>s+p.y,0)/buffer.length;
+    const centerZ = buffer.reduce((s,p)=>s+p.z,0)/buffer.length;
+    let varX=0,varY=0,varZ=0;
+    for(let p of buffer){
+        varX += (p.x-centerX)*(p.x-centerX);
+        varY += (p.y-centerY)*(p.y-centerY);
+        varZ += (p.z-centerZ)*(p.z-centerZ);
+    }
+    // Dominant plane is the one with smallest variance (least motion)
+    let projectXY = false, projectXZ = false, projectYZ = false;
+    if(varZ <= varX && varZ <= varY){ // motion mostly in XY
+        projectXY = true;
+    } else if(varY <= varX && varY <= varZ){ // motion mostly in XZ
+        projectXZ = true;
+    } else { // motion mostly in YZ
+        projectYZ = true;
+    }
+
+    // Calculate average radius
+    let radius = 0;
+    for(let p of buffer){
+        let dx,dy;
+        if(projectXY){ dx = p.x-centerX; dy = p.y-centerY; }
+        else if(projectXZ){ dx = p.x-centerX; dy = p.z-centerZ; }
+        else { dx = p.y-centerY; dy = p.z-centerZ; }
+        const r = Math.sqrt(dx*dx + dy*dy);
+        radius += r;
+    }
+    radius /= buffer.length;
+    
+    // REJECT: Radius too small (not a circle, just jitter)
+    if(radius <= 0.12) return 0;
+    
+    // REJECT: Radius too large (not a circle gesture, too spread out)
+    if(radius >= 0.35) return 0;
+    
+    // Count angle changes (circular motion should have many)
+    let angleChanges = 0;
+    let lastAngle = null;
+    for(let i=0;i<buffer.length;i++){
+        let dx,dy;
+        if(projectXY){ dx = buffer[i].x-centerX; dy = buffer[i].y-centerY; }
+        else if(projectXZ){ dx = buffer[i].x-centerX; dy = buffer[i].z-centerZ; }
+        else { dx = buffer[i].y-centerY; dy = buffer[i].z-centerZ; }
+        const angle = Math.atan2(dy,dx);
+        if(lastAngle!==null){
+            let diff = angle - lastAngle;
+            while(diff>Math.PI) diff-=2*Math.PI;
+            while(diff<-Math.PI) diff+=2*Math.PI;
+            if(Math.abs(diff)>0.1) angleChanges++;
+        }
+        lastAngle = angle;
+    }
+    
+    // REJECT: Not enough angle changes (not circular motion)
+    if(angleChanges <= 15) return 0;
+    
+    // REJECT: Too much forward drift (circle should be in a plane)
+    const forwardDrift = Math.abs(buffer[buffer.length-1].z - buffer[0].z);
+    if(forwardDrift >= 0.10) return 0;
+    
+    // All rejection checks passed - this looks like a circle
+    return 0.8;
+}
+
+function detectBow(buffer){
+    // REJECTION-FIRST: Explicitly reject non-bow patterns before detection
+    if(buffer.length<30) return 0; // REJECT: insufficient data
+    
+    const firstThird = Math.floor(buffer.length*0.33);
+    const lastThird = Math.floor(buffer.length*0.67);
+    
+    // Calculate energy in hold phase (first third) and release phase (last third)
+    let holdEnergy = 0, releaseEnergy = 0;
+    for(let i=1;i<firstThird;i++){
+        const dx=buffer[i].x-buffer[i-1].x, dy=buffer[i].y-buffer[i-1].y, dz=buffer[i].z-buffer[i-1].z;
+        holdEnergy += Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    for(let i=lastThird+1;i<buffer.length;i++){
+        const dx=buffer[i].x-buffer[i-1].x, dy=buffer[i].y-buffer[i-1].y, dz=buffer[i].z-buffer[i-1].z;
+        releaseEnergy += Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    
+    const holdRatio = holdEnergy / (releaseEnergy+0.001);
+    
+    // REJECT: Hold phase too active (should be relatively still during hold)
+    if(holdRatio >= 0.35) return 0;
+    
+    // REJECT: Release not strong enough forward (bow release must be fast forward)
+    const forwardRelease = buffer[buffer.length-1].z - buffer[lastThird].z;
+    if(forwardRelease >= -0.20) return 0; // negative = forward, need at least -0.20
+    
+    // All rejection checks passed - this looks like a bow
+    return 0.8;
+}
+
+function classifyGestureHeuristic(buffer){
+    const scores = [
+        detectPoke(buffer),
+        detectSlash(buffer),
+        detectCircle(buffer),
+        detectBow(buffer)
+    ];
+    let bestIdx=0, bestVal=0;
+    for(let i=0;i<scores.length;i++){
+        if(scores[i]>bestVal){bestVal=scores[i]; bestIdx=i;}
+    }
+    return bestVal>=0.7 ? {name:GESTURE_LABELS[bestIdx], confidence:bestVal} : null;
+}
+
+function extractGestureFeatures(buffer, asTensor=true){
+    const window = buffer.slice(-GESTURE_WINDOW);
+    const first = window[0];
+    const rel = [];
+    let path = 0;
+    for(let i=0;i<window.length;i++){
+        const p=window[i];
+        if(i>0){
+            const prev=window[i-1];
+            const dx=p.x-prev.x, dy=p.y-prev.y, dz=p.z-prev.z;
+            path += Math.sqrt(dx*dx+dy*dy+dz*dz);
+        }
+        rel.push([p.x-first.x, p.y-first.y, p.z-first.z]);
+    }
+    const scale = Math.max(0.001, path);
+    for(let i=0;i<rel.length;i++){
+        rel[i][0]/=scale;
+        rel[i][1]/=scale;
+        rel[i][2]/=scale;
+    }
+    return asTensor ? tf.tensor3d([rel]) : rel;
+}
+
+async function ensureGestureModel(){
+    if(gestureModel) return;
+    await tf.ready();
+    gestureModel = tf.sequential({
+        layers:[
+            tf.layers.gru({
+                units:16,
+                inputShape:[GESTURE_WINDOW,3],
+                returnSequences:false,
+                recurrentActivation:"sigmoid"
+            }),
+            tf.layers.dense({units:GESTURE_LABELS.length, activation:"softmax"})
+        ]
+    });
+    gestureModel.compile({optimizer:"adam", loss:"categoricalCrossentropy"});
+    // warmup so the first inference is smooth
+    tf.tidy(()=>gestureModel.predict(tf.zeros([1,GESTURE_WINDOW,3])));
+}
+
+// ---------------------- UI UPDATE FUNCTIONS --------------------------
+function updateGestureUI(name, confidence, energy){
+    const nameEl = document.querySelector("#gesture-feedback .gesture-name");
+    const infoEl = document.querySelectorAll("#gesture-feedback .gesture-info");
+    const confFill = document.getElementById("confidence-fill");
+    
+    if(name && confidence){
+        nameEl.textContent = name.toUpperCase();
+        nameEl.style.color = confidence > 0.8 ? "#4CAF50" : confidence > 0.6 ? "#ff9800" : "#f44336";
+        if(infoEl[0]) infoEl[0].textContent = `Motion Energy: ${energy.toFixed(3)}`;
+        if(infoEl[1]) infoEl[1].textContent = `Confidence: ${(confidence*100).toFixed(1)}%`;
+        confFill.style.width = (confidence*100) + "%";
+    } else {
+        nameEl.textContent = "None";
+        nameEl.style.color = "#666";
+        if(infoEl[0]) infoEl[0].textContent = `Motion Energy: ${energy.toFixed(3)}`;
+        if(infoEl[1]) infoEl[1].textContent = `Confidence: 0%`;
+        confFill.style.width = "0%";
+    }
+}
+
+function onGestureDetected(name, confidence=0.9){
+    // Update UI
+    updateGestureUI(name, confidence, computeMotionEnergy(gestureBuffer));
+    
+    // Light integration with existing AR interaction: reuse excitement loop
+    redCubeExcited = true;
+    lastExcitedTime = performance.now();
+    if(catSound && catSound.paused){catSound.play();}
+    navigator.vibrate([60,40,60]);
+}
+
+async function maybeClassifyGesture(){
+    const now = performance.now();
+    const energy = computeMotionEnergy(gestureBuffer);
+    
+    // Always update UI with motion energy (even if below threshold)
+    updateGestureUI(null, 0, energy);
+    
+    // Hard cooldown after a confirmed gesture
+    if(now - lastDetectionTime < DETECTION_COOLDOWN_MS) return;
+    // Rate-limit classification so TF never runs every frame
+    if(now - lastInferenceTime < INFERENCE_COOLDOWN_MS) return;
+    if(gestureBuffer.length < MIN_GESTURE_FRAMES) return;
+    if(energy < MOTION_ENERGY_THRESHOLD) return;
+    
+    // GLOBAL INTENT GATE - MUST PASS ALL CONDITIONS
+    // This prevents slow, smooth, or small movements from triggering gestures
+    if(!checkUserIntent(gestureBuffer)) return; // Early return - no gesture detection
+    
+    lastInferenceTime = now;
+
+    // Record training data if active
+    if(isRecording && gestureBuffer.length>=GESTURE_WINDOW){
+        const features = extractGestureFeatures(gestureBuffer, false);
+        trainingData[isRecording].push(features);
+        const statusEl = document.getElementById("record-status");
+        if(statusEl) statusEl.textContent = `Recorded ${isRecording}: ${trainingData[isRecording].length} samples`;
+    }
+
+    // Heuristic detection (works immediately)
+    if(useHeuristicDetection){
+        const heuristic = classifyGestureHeuristic(gestureBuffer);
+        if(heuristic){
+            const name = heuristic.name;
+            const conf = heuristic.confidence || 0;
+            if(name === stableGestureName){
+                stableGestureFrames++;
+                stableGestureConfidence = Math.max(stableGestureConfidence, conf);
+            } else {
+                stableGestureName = name;
+                stableGestureFrames = 1;
+                stableGestureConfidence = conf;
+            }
+            // Hysteresis: require multiple frames above ON threshold
+            if(stableGestureConfidence >= GESTURE_CONFIDENCE && stableGestureFrames >= STABLE_HIT_FRAMES){
+                lastGestureName = name;
+                lastDetectionTime = now;
+                stableGestureName = null;
+                stableGestureFrames = 0;
+                stableGestureConfidence = 0;
+                gestureBuffer.length = 0; // clear buffer for next gesture
+                onGestureDetected(name, stableGestureConfidence);
+                return;
+            } else {
+                // Show candidate gesture but don't trigger yet
+                updateGestureUI(name, conf, energy);
+            }
+        }
+    }
+
+    // ML-based detection (optional, requires training)
+    if(gestureModel && Object.values(trainingData).some(arr=>arr.length>0)){
+        const input = extractGestureFeatures(gestureBuffer);
+        const logits = gestureModel.predict(input);
+        const probs = await logits.data();
+        input.dispose();
+        logits.dispose();
+
+        let bestIdx=0, bestVal=0;
+        for(let i=0;i<probs.length;i++){
+            if(probs[i]>bestVal){bestVal=probs[i]; bestIdx=i;}
+        }
+        const gestureName = GESTURE_LABELS[bestIdx];
+        if(bestVal >= GESTURE_CONFIDENCE){
+            if(gestureName === stableGestureName){
+                stableGestureFrames++;
+                stableGestureConfidence = Math.max(stableGestureConfidence, bestVal);
+            } else {
+                stableGestureName = gestureName;
+                stableGestureFrames = 1;
+                stableGestureConfidence = bestVal;
+            }
+            if(stableGestureConfidence >= GESTURE_CONFIDENCE && stableGestureFrames >= STABLE_HIT_FRAMES){
+                lastGestureName = gestureName;
+                lastDetectionTime = now;
+                stableGestureName = null;
+                stableGestureFrames = 0;
+                stableGestureConfidence = 0;
+                gestureBuffer.length = 0; // clear buffer for next gesture
+                onGestureDetected(gestureName, stableGestureConfidence);
+            } else {
+                // Show candidate gesture but don't trigger yet
+                updateGestureUI(gestureName, bestVal, energy);
+            }
+        } else {
+            // Show low confidence prediction
+            updateGestureUI(gestureName, bestVal, energy);
+        }
+    }
+}
+
+// ---------------------- TRAINING SYSTEM --------------------------
+async function startRecording(gestureName){
+    if(!GESTURE_LABELS.includes(gestureName)) return;
+    isRecording = gestureName;
+    const btn = document.getElementById("record-btn");
+    const statusEl = document.getElementById("record-status");
+    if(btn) btn.classList.add("recording");
+    if(btn) btn.textContent = "Stop Recording";
+    if(statusEl) statusEl.textContent = `Recording ${gestureName}...`;
+}
+
+function stopRecording(){
+    isRecording = null;
+    const btn = document.getElementById("record-btn");
+    const statusEl = document.getElementById("record-status");
+    if(btn) btn.classList.remove("recording");
+    if(btn) btn.textContent = "Record";
+    if(statusEl) {
+        const counts = Object.entries(trainingData).map(([k,v])=>`${k}:${v.length}`).join(", ");
+        statusEl.textContent = counts || "No samples recorded";
+    }
+}
+
+async function trainModel(){
+    const totalSamples = Object.values(trainingData).reduce((s,arr)=>s+arr.length,0);
+    const statusEl = document.getElementById("model-status");
+    if(totalSamples<4){
+        if(statusEl) statusEl.textContent = "Need at least 1 sample per gesture to train";
+        return;
+    }
+    await ensureGestureModel();
+    if(statusEl) statusEl.textContent = "Training model...";
+    
+    const xs = [];
+    const ys = [];
+    for(let i=0;i<GESTURE_LABELS.length;i++){
+        const label = GESTURE_LABELS[i];
+        const samples = trainingData[label];
+        for(let sample of samples){
+            xs.push(tf.tensor3d([sample]));
+            const oneHot = new Array(GESTURE_LABELS.length).fill(0);
+            oneHot[i] = 1;
+            ys.push(oneHot);
+        }
+    }
+    
+    if(xs.length===0) return;
+    const xTensor = tf.concat(xs);
+    const yTensor = tf.tensor2d(ys);
+    
+    await gestureModel.fit(xTensor, yTensor, {
+        epochs: 30,
+        batchSize: Math.min(8, xs.length),
+        shuffle: true,
+        verbose: 0
+    });
+    
+    xs.forEach(t=>t.dispose());
+    xTensor.dispose();
+    yTensor.dispose();
+    if(statusEl) statusEl.textContent = "Training complete! Switched to ML mode.";
+    useHeuristicDetection = false; // switch to ML after training
+}
+
+// ---------------------- UI BUTTON HANDLERS --------------------------
+document.getElementById("ui-toggle").onclick = ()=>{
+    const overlay = document.getElementById("ui-overlay");
+    overlay.classList.toggle("visible");
+};
+
+document.getElementById("record-btn").onclick = ()=>{
+    if(isRecording){
+        stopRecording();
+    } else {
+        const gesture = document.getElementById("gesture-select").value;
+        startRecording(gesture);
+    }
+};
+
+document.getElementById("save-dataset-btn").onclick = ()=>{
+    const blob = new Blob([JSON.stringify(trainingData)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "gesture-dataset.json";
+    a.click();
+};
+
+document.getElementById("load-dataset-btn").onclick = ()=>{
+    document.getElementById("dataset-input").click();
+};
+
+document.getElementById("dataset-input").onchange = (e)=>{
+    const f = e.target.files[0];
+    if(!f) return;
+    const reader = new FileReader();
+    reader.onload = ()=>{
+        try {
+            trainingData = JSON.parse(reader.result);
+            const statusEl = document.getElementById("record-status");
+            const counts = Object.entries(trainingData).map(([k,v])=>`${k}:${v.length}`).join(", ");
+            if(statusEl) statusEl.textContent = `Loaded: ${counts}`;
+        } catch(err){
+            alert("Error loading dataset: " + err.message);
+        }
+    };
+    reader.readAsText(f);
+};
+
+document.getElementById("train-btn").onclick = ()=>{
+    trainModel();
+};
+
+document.getElementById("save-model-btn").onclick = async ()=>{
+    if(!gestureModel){
+        alert("No model to save. Train a model first.");
+        return;
+    }
+    try {
+        await gestureModel.save("downloads://gesture-model");
+        const statusEl = document.getElementById("model-status");
+        if(statusEl) statusEl.textContent = "Model saved!";
+    } catch(err){
+        alert("Error saving model: " + err.message);
+    }
+};
+
+document.getElementById("load-model-btn").onclick = ()=>{
+    document.getElementById("model-input").click();
+};
+
+document.getElementById("model-input").onchange = async (e)=>{
+    const files = e.target.files;
+    if(!files || files.length===0) return;
+    try {
+        gestureModel = await tf.loadLayersModel(tf.io.browserFiles(files));
+        const statusEl = document.getElementById("model-status");
+        if(statusEl) statusEl.textContent = "Model loaded!";
+        useHeuristicDetection = false;
+    } catch(err){
+        alert("Error loading model: " + err.message);
+    }
+};
+
+// ---------------------- ENTER AR --------------------------
+document.getElementById("start-ar").onclick = async ()=>{
+    initAudio();
+    xrSession = await navigator.xr.requestSession("immersive-ar",{requiredFeatures:["local","hit-test"]});
+    const canvas=document.createElement("canvas");
+    canvas.width=window.innerWidth;
+    canvas.height=window.innerHeight;
+    canvas.style.position="fixed";
+    canvas.style.top="0";
+    canvas.style.left="0";
+    canvas.style.width="100%";
+    canvas.style.height="100%";
+    canvas.style.zIndex="-1";
+    document.body.appendChild(canvas);
+
+    gl=canvas.getContext("webgl",{xrCompatible:true});
+    await gl.makeXRCompatible();
+    xrSession.updateRenderState({baseLayer:new XRWebGLLayer(xrSession,gl)});
+    refSpace = await xrSession.requestReferenceSpace("local");
+
+    const viewerSpace=await xrSession.requestReferenceSpace("viewer");
+    hitTestSource = await xrSession.requestHitTestSource({space:viewerSpace});
+
+    initPrograms(gl);
+    document.getElementById("start-ar").remove();
+    document.getElementById("ui-toggle").style.display = "block"; // Show UI toggle
+
+    // Immediately place red cube in front of camera
+    worldCubeMatrix = identity();
+    worldCubeMatrix[12] = redCubeOriginalPos.x;
+    worldCubeMatrix[13] = redCubeOriginalPos.y;
+    worldCubeMatrix[14] = redCubeOriginalPos.z;
+    worldCubePlaced = true;
+
+    // Expose training API to console
+    window.gestureTraining = {
+        start: startRecording,
+        stop: stopRecording,
+        train: trainModel,
+        useHeuristic: ()=>useHeuristicDetection=true,
+        useML: ()=>useHeuristicDetection=false,
+        status: ()=>console.log("Heuristic:",useHeuristicDetection,"Samples:",Object.fromEntries(Object.entries(trainingData).map(([k,v])=>[k,v.length])))
+    };
+    console.log("Gesture training API: window.gestureTraining.start('poke'), .stop(), .train()");
+
+    xrSession.requestAnimationFrame(onXRFrame);
+};
+
+// ---------------------- COLLISION --------------------------
+function sphereCubeCollision(camX,camY,camZ, cubeMatrix){
+    let cx=cubeMatrix[12], cy=cubeMatrix[13], cz=cubeMatrix[14];
+    let dx=camX-cx, dy=camY-cy, dz=camZ-cz;
+    return (dx*dx+dy*dy+dz*dz) <= SPHERE_RADIUS*SPHERE_RADIUS;
+}
+
+// ---------------------- RENDER --------------------------
+function onXRFrame(t,frame){
+    xrSession.requestAnimationFrame(onXRFrame);
+    const pose=frame.getViewerPose(refSpace);
+    if(!pose) return;
+
+    const layer=xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.viewport(0,0,layer.framebufferWidth,layer.framebufferHeight);
+    gl.clearColor(0,0,0,0);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+
+    const view=pose.views[0];
+    const proj=view.projectionMatrix;
+    const viewMat=view.transform.inverse.matrix;
+
+    const camMat = view.transform.matrix;
+    let camX = camMat[12], camY = camMat[13], camZ = camMat[14];
+    const sampleTime = (frame.predictedDisplayTime || t || performance.now());
+    pushGestureSample(camX,camY,camZ,sampleTime);
+    // fire-and-forget to keep render loop smooth
+    maybeClassifyGesture().catch(err=>console.warn("gesture classify err",err));
+
+    gl.useProgram(cubeProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER,cubeVBO);
+    let locPos=gl.getAttribLocation(cubeProgram,"pos");
+    gl.enableVertexAttribArray(locPos);
+    gl.vertexAttribPointer(locPos,3,gl.FLOAT,false,0,0);
+
+    let uProj=gl.getUniformLocation(cubeProgram,"proj");
+    let uView=gl.getUniformLocation(cubeProgram,"view");
+    let uModel=gl.getUniformLocation(cubeProgram,"model");
+    let uColor=gl.getUniformLocation(cubeProgram,"color");
+    gl.uniformMatrix4fv(uProj,false,proj);
+    gl.uniformMatrix4fv(uView,false,viewMat);
+
+    // ---------------- BLUE SPHERE ----------------
+    let sphere = identity();
+    sphere.set(quatToMatrix(quat));
+    sphere[12] = camX;
+    sphere[13] = camY;
+    sphere[14] = camZ;
+
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    gl.uniformMatrix4fv(uModel,false,sphere);
+    gl.uniform4fv(uColor,new Float32Array([0,0,1,0])); // fully invisible
+    gl.drawArrays(gl.TRIANGLES,0,36);
+    gl.depthMask(true);
+    gl.disable(gl.BLEND);
+
+    // ---------------- RED CUBE ----------------
+    if(worldCubePlaced){
+        const now = performance.now();
+
+        // Collision detection
+        if(sphereCubeCollision(camX,camY,camZ,worldCubeMatrix)){
+            redCubeExcited = true;
+            lastExcitedTime = now;
+            if(catSound.paused){catSound.play();}
+            navigator.vibrate([150,100,150]);
+        }
+
+        // If excited, move toward camera with random wandering
+        if(redCubeExcited){
+            let targetX = camX + (Math.random()-0.5)*0.5;
+            let targetZ = camZ + (Math.random()-0.5)*0.5;
+            worldCubeMatrix[12] = lerp(worldCubeMatrix[12], targetX, 0.02);
+            worldCubeMatrix[14] = lerp(worldCubeMatrix[14], targetZ, 0.02);
+
+            // Check if 10s passed without new collision, stop being excited
+            if(now - lastExcitedTime > 10000){
+                redCubeExcited = false;
+            }
+        } else {
+            // Smoothly return to original position
+            worldCubeMatrix[12] = lerp(worldCubeMatrix[12], redCubeOriginalPos.x, 0.02);
+            worldCubeMatrix[13] = lerp(worldCubeMatrix[13], redCubeOriginalPos.y, 0.02);
+            worldCubeMatrix[14] = lerp(worldCubeMatrix[14], redCubeOriginalPos.z, 0.02);
+        }
+
+        gl.uniformMatrix4fv(uModel,false,worldCubeMatrix);
+        gl.uniform4fv(uColor,new Float32Array([1.0,0.2,0.2,0.9])); // red
+        gl.drawArrays(gl.TRIANGLES,0,36);
+
+        // update catBG volume by distance
+        let dx2=camX-worldCubeMatrix[12], dy2=camY-worldCubeMatrix[13], dz2=camZ-worldCubeMatrix[14];
+        let dist = Math.sqrt(dx2*dx2+dy2*dy2+dz2*dz2);
+        let vol = Math.max(0.05,Math.min(1.0,1.0 - dist/15));
+        catBG.volume = vol;
+    }
+}
+</script>
+</body>
+</html>
