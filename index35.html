@@ -42,14 +42,21 @@ const SPHERE_RADIUS = 0.25;
 const GESTURE_WINDOW = 45; // ~30-50 frames window
 const MIN_GESTURE_FRAMES = 18;
 const MOTION_ENERGY_THRESHOLD = 0.08; // tuned to ignore hand jitter
-const INFERENCE_COOLDOWN_MS = 700;
-const GESTURE_CONFIDENCE = 0.78;
+const INFERENCE_COOLDOWN_MS = 180; // min time between classification attempts
+const DETECTION_COOLDOWN_MS = 700; // cooldown after successful gesture
+const GESTURE_CONFIDENCE = 0.78;   // ON threshold
+const GESTURE_CONFIDENCE_OFF = 0.6; // OFF threshold (hysteresis)
+const STABLE_HIT_FRAMES = 2;       // require multiple hits above ON
 const GESTURE_LABELS = ["poke", "slash", "circle", "bow"];
 
 let gestureBuffer = [];
 let lastInferenceTime = 0;
+let lastDetectionTime = 0;
 let gestureModel = null;
 let lastGestureName = null;
+let stableGestureName = null;
+let stableGestureFrames = 0;
+let stableGestureConfidence = 0;
 
 // ---------------------- ORIENTATION --------------------------
 function quatNormalize(q){
@@ -145,6 +152,10 @@ function initAudio(){
 }
 
 // ---------------------- GESTURE PIPELINE --------------------------
+let useHeuristicDetection = true; // works immediately, ML optional
+let trainingData = {poke:[], slash:[], circle:[], bow:[]};
+let isRecording = null;
+
 function pushGestureSample(x,y,z,timeMs){
     gestureBuffer.push({x,y,z,time:timeMs});
     if(gestureBuffer.length>GESTURE_WINDOW){
@@ -163,7 +174,137 @@ function computeMotionEnergy(buffer){
     return energy;
 }
 
-function extractGestureFeatures(buffer){
+// ---------------------- HEURISTIC GESTURE DETECTION --------------------------
+function detectPoke(buffer){
+    if(buffer.length<10) return 0;
+    const mid = Math.floor(buffer.length*0.4);
+    const end = buffer.length-1;
+    const startZ = buffer[0].z;
+    const endZ = buffer[end].z;
+    const forwardMotion = startZ - endZ; // positive = forward
+    const maxZVel = 0;
+    let maxVel = 0;
+    for(let i=1;i<buffer.length;i++){
+        const dz = buffer[i-1].z - buffer[i].z;
+        const dt = buffer[i].time - buffer[i-1].time;
+        const vel = dt>0 ? Math.abs(dz)/(dt*0.001) : 0;
+        if(vel>maxVel) maxVel=vel;
+    }
+    const lateralMotion = Math.abs(buffer[end].x-buffer[0].x) + Math.abs(buffer[end].y-buffer[0].y);
+    if(forwardMotion>0.15 && maxVel>0.8 && lateralMotion<0.1) return 0.9;
+    return 0;
+}
+
+function detectSlash(buffer){
+    if(buffer.length<15) return 0;
+    const mid = Math.floor(buffer.length*0.5);
+    let maxXVel=0, maxYVel=0;
+    for(let i=1;i<buffer.length;i++){
+        const dx = buffer[i].x - buffer[i-1].x;
+        const dy = buffer[i].y - buffer[i-1].y;
+        const dt = buffer[i].time - buffer[i-1].time;
+        if(dt>0){
+            const xVel = Math.abs(dx)/(dt*0.001);
+            const yVel = Math.abs(dy)/(dt*0.001);
+            if(xVel>maxXVel) maxXVel=xVel;
+            if(yVel>maxYVel) maxYVel=yVel;
+        }
+    }
+    const horizontalMotion = Math.max(maxXVel, maxYVel);
+    const forwardMotion = Math.abs(buffer[buffer.length-1].z - buffer[0].z);
+    if(horizontalMotion>1.2 && forwardMotion<0.08) return 0.85;
+    return 0;
+}
+
+function detectCircle(buffer){
+    if(buffer.length<25) return 0;
+    // Compute principal motion plane (orientation independent)
+    const centerX = buffer.reduce((s,p)=>s+p.x,0)/buffer.length;
+    const centerY = buffer.reduce((s,p)=>s+p.y,0)/buffer.length;
+    const centerZ = buffer.reduce((s,p)=>s+p.z,0)/buffer.length;
+    let varX=0,varY=0,varZ=0;
+    for(let p of buffer){
+        varX += (p.x-centerX)*(p.x-centerX);
+        varY += (p.y-centerY)*(p.y-centerY);
+        varZ += (p.z-centerZ)*(p.z-centerZ);
+    }
+    // Dominant plane is the one with smallest variance (least motion)
+    let projectXY = false, projectXZ = false, projectYZ = false;
+    if(varZ <= varX && varZ <= varY){ // motion mostly in XY
+        projectXY = true;
+    } else if(varY <= varX && varY <= varZ){ // motion mostly in XZ
+        projectXZ = true;
+    } else { // motion mostly in YZ
+        projectYZ = true;
+    }
+
+    let radius = 0;
+    for(let p of buffer){
+        let dx,dy;
+        if(projectXY){ dx = p.x-centerX; dy = p.y-centerY; }
+        else if(projectXZ){ dx = p.x-centerX; dy = p.z-centerZ; }
+        else { dx = p.y-centerY; dy = p.z-centerZ; }
+        const r = Math.sqrt(dx*dx + dy*dy);
+        radius += r;
+    }
+    radius /= buffer.length;
+    if(radius<0.05) return 0;
+    let angleChanges = 0;
+    let lastAngle = null;
+    for(let i=0;i<buffer.length;i++){
+        let dx,dy;
+        if(projectXY){ dx = buffer[i].x-centerX; dy = buffer[i].y-centerY; }
+        else if(projectXZ){ dx = buffer[i].x-centerX; dy = buffer[i].z-centerZ; }
+        else { dx = buffer[i].y-centerY; dy = buffer[i].z-centerZ; }
+        const angle = Math.atan2(dy,dx);
+        if(lastAngle!==null){
+            let diff = angle - lastAngle;
+            while(diff>Math.PI) diff-=2*Math.PI;
+            while(diff<-Math.PI) diff+=2*Math.PI;
+            if(Math.abs(diff)>0.1) angleChanges++;
+        }
+        lastAngle = angle;
+    }
+    const forwardDrift = Math.abs(buffer[buffer.length-1].z - buffer[0].z);
+    if(angleChanges>8 && forwardDrift<0.15 && radius>0.06 && radius<0.45) return 0.8;
+    return 0;
+}
+
+function detectBow(buffer){
+    if(buffer.length<20) return 0;
+    const firstThird = Math.floor(buffer.length*0.33);
+    const lastThird = Math.floor(buffer.length*0.67);
+    let holdEnergy = 0, releaseEnergy = 0;
+    for(let i=1;i<firstThird;i++){
+        const dx=buffer[i].x-buffer[i-1].x, dy=buffer[i].y-buffer[i-1].y, dz=buffer[i].z-buffer[i-1].z;
+        holdEnergy += Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    for(let i=lastThird+1;i<buffer.length;i++){
+        const dx=buffer[i].x-buffer[i-1].x, dy=buffer[i].y-buffer[i-1].y, dz=buffer[i].z-buffer[i-1].z;
+        releaseEnergy += Math.sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    const holdRatio = holdEnergy / (releaseEnergy+0.001);
+    const forwardRelease = buffer[buffer.length-1].z - buffer[lastThird].z;
+    // Slightly relaxed thresholds to reduce user frustration
+    if(holdRatio<0.5 && forwardRelease<-0.08) return 0.8;
+    return 0;
+}
+
+function classifyGestureHeuristic(buffer){
+    const scores = [
+        detectPoke(buffer),
+        detectSlash(buffer),
+        detectCircle(buffer),
+        detectBow(buffer)
+    ];
+    let bestIdx=0, bestVal=0;
+    for(let i=0;i<scores.length;i++){
+        if(scores[i]>bestVal){bestVal=scores[i]; bestIdx=i;}
+    }
+    return bestVal>=0.7 ? {name:GESTURE_LABELS[bestIdx], confidence:bestVal} : null;
+}
+
+function extractGestureFeatures(buffer, asTensor=true){
     const window = buffer.slice(-GESTURE_WINDOW);
     const first = window[0];
     const rel = [];
@@ -183,7 +324,7 @@ function extractGestureFeatures(buffer){
         rel[i][1]/=scale;
         rel[i][2]/=scale;
     }
-    return tf.tensor3d([rel]);
+    return asTensor ? tf.tensor3d([rel]) : rel;
 }
 
 async function ensureGestureModel(){
@@ -216,29 +357,138 @@ function onGestureDetected(name){
 
 async function maybeClassifyGesture(){
     const now = performance.now();
+    // Hard cooldown after a confirmed gesture
+    if(now - lastDetectionTime < DETECTION_COOLDOWN_MS) return;
+    // Rate-limit classification so TF never runs every frame
     if(now - lastInferenceTime < INFERENCE_COOLDOWN_MS) return;
     if(gestureBuffer.length < MIN_GESTURE_FRAMES) return;
     const energy = computeMotionEnergy(gestureBuffer);
     if(energy < MOTION_ENERGY_THRESHOLD) return;
 
-    await ensureGestureModel();
     lastInferenceTime = now;
+    console.log("gesture energy:", energy.toFixed(3));
 
-    const input = extractGestureFeatures(gestureBuffer);
-    const logits = gestureModel.predict(input);
-    const probs = await logits.data();
-    input.dispose();
-    logits.dispose();
+    // Record training data if active
+    if(isRecording && gestureBuffer.length>=GESTURE_WINDOW){
+        const features = extractGestureFeatures(gestureBuffer, false);
+        trainingData[isRecording].push(features);
+        console.log(`Recorded ${isRecording}, total: ${trainingData[isRecording].length}`);
+    }
 
-    let bestIdx=0, bestVal=0;
-    for(let i=0;i<probs.length;i++){
-        if(probs[i]>bestVal){bestVal=probs[i]; bestIdx=i;}
+    // Heuristic detection (works immediately)
+    if(useHeuristicDetection){
+        const heuristic = classifyGestureHeuristic(gestureBuffer);
+        if(heuristic){
+            const name = heuristic.name;
+            const conf = heuristic.confidence || 0;
+            if(name === stableGestureName){
+                stableGestureFrames++;
+                stableGestureConfidence = Math.max(stableGestureConfidence, conf);
+            } else {
+                stableGestureName = name;
+                stableGestureFrames = 1;
+                stableGestureConfidence = conf;
+            }
+            // Hysteresis: require multiple frames above ON threshold
+            if(stableGestureConfidence >= GESTURE_CONFIDENCE && stableGestureFrames >= STABLE_HIT_FRAMES){
+                console.log("gesture detected (heuristic):", name, "conf:", stableGestureConfidence.toFixed(2));
+                lastGestureName = name;
+                lastDetectionTime = now;
+                stableGestureName = null;
+                stableGestureFrames = 0;
+                stableGestureConfidence = 0;
+                gestureBuffer.length = 0; // clear buffer for next gesture
+                onGestureDetected(name);
+                return;
+            }
+        }
     }
-    const gestureName = GESTURE_LABELS[bestIdx];
-    if(bestVal >= GESTURE_CONFIDENCE && gestureName !== lastGestureName){
-        lastGestureName = gestureName;
-        onGestureDetected(gestureName);
+
+    // ML-based detection (optional, requires training)
+    if(gestureModel && Object.values(trainingData).some(arr=>arr.length>0)){
+        const input = extractGestureFeatures(gestureBuffer);
+        const logits = gestureModel.predict(input);
+        const probs = await logits.data();
+        input.dispose();
+        logits.dispose();
+
+        let bestIdx=0, bestVal=0;
+        for(let i=0;i<probs.length;i++){
+            if(probs[i]>bestVal){bestVal=probs[i]; bestIdx=i;}
+        }
+        const gestureName = GESTURE_LABELS[bestIdx];
+        if(bestVal >= GESTURE_CONFIDENCE){
+            if(gestureName === stableGestureName){
+                stableGestureFrames++;
+                stableGestureConfidence = Math.max(stableGestureConfidence, bestVal);
+            } else {
+                stableGestureName = gestureName;
+                stableGestureFrames = 1;
+                stableGestureConfidence = bestVal;
+            }
+            if(stableGestureConfidence >= GESTURE_CONFIDENCE && stableGestureFrames >= STABLE_HIT_FRAMES){
+                console.log("gesture detected (ML):", gestureName, "conf:", stableGestureConfidence.toFixed(2));
+                lastGestureName = gestureName;
+                lastDetectionTime = now;
+                stableGestureName = null;
+                stableGestureFrames = 0;
+                stableGestureConfidence = 0;
+                gestureBuffer.length = 0; // clear buffer for next gesture
+                onGestureDetected(gestureName);
+            }
+        }
     }
+}
+
+// ---------------------- TRAINING SYSTEM --------------------------
+async function startRecording(gestureName){
+    if(!GESTURE_LABELS.includes(gestureName)) return;
+    isRecording = gestureName;
+    console.log(`Recording ${gestureName}...`);
+}
+
+function stopRecording(){
+    isRecording = null;
+}
+
+async function trainModel(){
+    const totalSamples = Object.values(trainingData).reduce((s,arr)=>s+arr.length,0);
+    if(totalSamples<4){
+        console.warn("Need at least 1 sample per gesture to train");
+        return;
+    }
+    await ensureGestureModel();
+    console.log("Training model...");
+    
+    const xs = [];
+    const ys = [];
+    for(let i=0;i<GESTURE_LABELS.length;i++){
+        const label = GESTURE_LABELS[i];
+        const samples = trainingData[label];
+        for(let sample of samples){
+            xs.push(tf.tensor3d([sample]));
+            const oneHot = new Array(GESTURE_LABELS.length).fill(0);
+            oneHot[i] = 1;
+            ys.push(oneHot);
+        }
+    }
+    
+    if(xs.length===0) return;
+    const xTensor = tf.concat(xs);
+    const yTensor = tf.tensor2d(ys);
+    
+    await gestureModel.fit(xTensor, yTensor, {
+        epochs: 30,
+        batchSize: Math.min(8, xs.length),
+        shuffle: true,
+        verbose: 0
+    });
+    
+    xs.forEach(t=>t.dispose());
+    xTensor.dispose();
+    yTensor.dispose();
+    console.log("Training complete! Switched to ML mode.");
+    useHeuristicDetection = false; // switch to ML after training
 }
 
 // ---------------------- ENTER AR --------------------------
@@ -273,6 +523,17 @@ document.getElementById("start-ar").onclick = async ()=>{
     worldCubeMatrix[13] = redCubeOriginalPos.y;
     worldCubeMatrix[14] = redCubeOriginalPos.z;
     worldCubePlaced = true;
+
+    // Expose training API to console
+    window.gestureTraining = {
+        start: startRecording,
+        stop: stopRecording,
+        train: trainModel,
+        useHeuristic: ()=>useHeuristicDetection=true,
+        useML: ()=>useHeuristicDetection=false,
+        status: ()=>console.log("Heuristic:",useHeuristicDetection,"Samples:",Object.fromEntries(Object.entries(trainingData).map(([k,v])=>[k,v.length])))
+    };
+    console.log("Gesture training API: window.gestureTraining.start('poke'), .stop(), .train()");
 
     xrSession.requestAnimationFrame(onXRFrame);
 };
