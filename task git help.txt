@@ -2,45 +2,20 @@ auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable
 
 
 
-# Applications to Monitor
 $TargetApps = @("calc.exe","notepad.exe","cmd.exe","powershell.exe","mstsc.exe")
 
-# Log file location
-$LogFile = "C:\ProcessAlerts.log"
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=4688
+} -MaxEvents 50 |
 
-Write-Host "Monitoring applications... Press Ctrl+C to stop." -ForegroundColor Yellow
+Where-Object {
+    $TargetApps -contains $_.Properties[5].Value.ToLower()
+} |
 
-while ($true) {
+Select-Object TimeCreated,
+              @{Name="Process";Expression={$_.Properties[5].Value}},
+              @{Name="User";Expression={$_.Properties[1].Value}} |
 
-    $Events = Get-WinEvent -FilterHashtable @{
-        LogName   = 'Security'
-        Id        = 4688
-        StartTime = (Get-Date).AddSeconds(-5)
-    }
+Out-GridView -Title "Application Monitoring Alerts"
 
-    $FilteredEvents = foreach ($Event in $Events) {
-
-        $ProcessName = $Event.Properties[5].Value
-
-        if ($TargetApps -contains $ProcessName.ToLower()) {
-
-            # Log to file
-            Add-Content -Path $LogFile `
-                -Value "ALERT: $ProcessName opened at $($Event.TimeCreated)"
-
-            # Send to GridView
-            [PSCustomObject]@{
-                TimeCreated = $Event.TimeCreated
-                ProcessName = $ProcessName
-                EventID     = $Event.Id
-                User        = $Event.Properties[1].Value
-            }
-        }
-    }
-
-    if ($FilteredEvents) {
-        $FilteredEvents | Out-GridView -Title "Application Monitoring Alerts"
-    }
-
-    Start-Sleep -Seconds 5
-}
