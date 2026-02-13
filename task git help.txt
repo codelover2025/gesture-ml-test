@@ -1,25 +1,7 @@
-$TargetApps = @("calc.exe","notepad.exe","cmd.exe","powershell.exe","mstsc.exe")
-
-# Get the last 50 security events for process creation
-$Events = Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4688} -MaxEvents 50 -ErrorAction SilentlyContinue
-
-$Results = foreach ($Event in $Events) {
-    # Extract the process path from the event properties
-    $ProcessPath = $Event.Properties[5].Value
-    $User = $Event.Properties[1].Value
-    
-    # Check if the path ends with any of our target filenames
-    foreach ($App in $TargetApps) {
-        if ($ProcessPath -like "*\$App") {
-            [PSCustomObject]@{
-                TimeCreated = $Event.TimeCreated
-                Process     = $ProcessPath
-                User        = $User
-            }
-            # Log to a text file for a permanent record
-            "$($Event.TimeCreated): $User started $ProcessPath" | Out-File -FilePath "C:\AppLog.txt" -Append
-        }
-    }
-}
-
-$Results | Out-GridView -Title "Application Monitoring Alerts"
+Get-WinEvent -LogName Application -MaxEvents 10 |
+Select-Object TimeCreated,
+              Id,
+              LevelDisplayName,
+              ProviderName,
+              Message |
+Out-GridView -Title "Top 10 Application Event Logs - DC"
