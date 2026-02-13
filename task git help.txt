@@ -1,0 +1,46 @@
+auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable
+
+
+
+# Applications to Monitor
+$TargetApps = @("calc.exe","notepad.exe","cmd.exe","powershell.exe","mstsc.exe")
+
+# Log file location
+$LogFile = "C:\ProcessAlerts.log"
+
+Write-Host "Monitoring applications... Press Ctrl+C to stop." -ForegroundColor Yellow
+
+while ($true) {
+
+    $Events = Get-WinEvent -FilterHashtable @{
+        LogName   = 'Security'
+        Id        = 4688
+        StartTime = (Get-Date).AddSeconds(-5)
+    }
+
+    $FilteredEvents = foreach ($Event in $Events) {
+
+        $ProcessName = $Event.Properties[5].Value
+
+        if ($TargetApps -contains $ProcessName.ToLower()) {
+
+            # Log to file
+            Add-Content -Path $LogFile `
+                -Value "ALERT: $ProcessName opened at $($Event.TimeCreated)"
+
+            # Send to GridView
+            [PSCustomObject]@{
+                TimeCreated = $Event.TimeCreated
+                ProcessName = $ProcessName
+                EventID     = $Event.Id
+                User        = $Event.Properties[1].Value
+            }
+        }
+    }
+
+    if ($FilteredEvents) {
+        $FilteredEvents | Out-GridView -Title "Application Monitoring Alerts"
+    }
+
+    Start-Sleep -Seconds 5
+}
