@@ -1,21 +1,13 @@
-auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable
-
-
-
 $TargetApps = @("calc.exe","notepad.exe","cmd.exe","powershell.exe","mstsc.exe")
 
 Get-WinEvent -FilterHashtable @{
-    LogName='Security'
-    Id=4688
+    LogName = 'Security'
+    Id      = 4688
 } -MaxEvents 50 |
-
 Where-Object {
     $TargetApps -contains $_.Properties[5].Value.ToLower()
 } |
-
 Select-Object TimeCreated,
               @{Name="Process";Expression={$_.Properties[5].Value}},
               @{Name="User";Expression={$_.Properties[1].Value}} |
-
 Out-GridView -Title "Application Monitoring Alerts"
-
