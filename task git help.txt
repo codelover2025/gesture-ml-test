@@ -1,7 +1,67 @@
-Get-WinEvent -LogName Application -MaxEvents 10 |
-Select-Object TimeCreated,
-              Id,
-              LevelDisplayName,
-              ProviderName,
-              Message |
-Out-GridView -Title "Top 10 Application Event Logs - DC"
+# ================================
+# Project 5 – Log Collection Script
+# Ensure date & time visible
+# ================================
+
+Write-Host "===== Log Collection Started ====="
+Get-Date
+Write-Host ""
+
+# --------------------------------
+# A. Last 2 Failed Logon Events (Event ID 4625)
+# --------------------------------
+Write-Host "===== Last 2 Failed Logon Events ====="
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=4625
+} -MaxEvents 2 | 
+Select-Object TimeCreated, Id, @{Name="User";Expression={$_.Properties[5].Value}} |
+Format-Table -AutoSize
+
+Write-Host ""
+
+# --------------------------------
+# B. Last 2 Successful Logon Events (Event ID 4624)
+# --------------------------------
+Write-Host "===== Last 2 Successful Logon Events ====="
+Get-WinEvent -FilterHashtable @{
+    LogName='Security'
+    Id=4624
+} -MaxEvents 2 |
+Select-Object TimeCreated, Id, @{Name="User";Expression={$_.Properties[5].Value}} |
+Format-Table -AutoSize
+
+Write-Host ""
+
+# --------------------------------
+# C. Search for EncodedCommand in Logs
+# --------------------------------
+Write-Host "===== Searching for EncodedCommand in Logs ====="
+Get-WinEvent -LogName Security -MaxEvents 200 |
+Where-Object { $_.Message -match "EncodedCommand" } |
+Select-Object TimeCreated, Id, Message |
+Format-Table -Wrap
+
+Write-Host ""
+
+# --------------------------------
+# D. All Logs Related to Administrator
+# --------------------------------
+Write-Host "===== Logs for Administrator ====="
+Get-WinEvent -LogName Security -MaxEvents 500 |
+Where-Object { $_.Message -match "Administrator" } |
+Select-Object TimeCreated, Id, Message |
+Format-Table -Wrap
+
+Write-Host ""
+
+# --------------------------------
+# E. Windows Defender Logs
+# --------------------------------
+Write-Host "===== Windows Defender Logs ====="
+Get-WinEvent -LogName "Microsoft-Windows-Windows Defender/Operational" -MaxEvents 10 |
+Select-Object TimeCreated, Id, LevelDisplayName, Message |
+Format-Table -Wrap
+
+Write-Host ""
+Write-Host "===== Log Collection Completed ====="
