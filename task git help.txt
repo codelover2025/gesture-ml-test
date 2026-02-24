@@ -1,15 +1,3 @@
-A:
-cls
-$command = "Get-Service"
-$bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
-$encoded = [Convert]::ToBase64String($bytes)
-$encoded
-
-
-powershell.exe -EncodedCommand RwBlAHQALQBTAGUAcgB2AGkAYwBlAA==
-
-B:
-[System.Text.Encoding]::Unicode.GetString(
-[Convert]::FromBase64String("VwByAGkAdABlAC0ASABvAHMAdAAgACcAVwBlAGwAYwBvAG0AZQAgAHQAbwAgAFAAcgBvAGoAZQBjAHQAIAA1ACcA"))
-
-Write-Host 'Welcome to Project 5'
+Get-WinEvent -LogName System -MaxEvents 10 | 
+Format-Table TimeCreated, Id, LevelDisplayName, Message -Wrap |
+Out-File C:\Top10_SystemLogs.txt
