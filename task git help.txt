@@ -1,3 +1,4 @@
-Get-WinEvent -LogName System -MaxEvents 10 | 
-Format-Table TimeCreated, Id, LevelDisplayName, Message -Wrap |
-Out-File C:\Top10_SystemLogs.txt
+Get-NetTCPConnection -State Listen |
+Where-Object { $_.LocalAddress -match "^\d+\.\d+\.\d+\.\d+$" -and $_.LocalAddress -ne "0.0.0.0" } |
+Select LocalAddress, LocalPort |
+Sort LocalPort
