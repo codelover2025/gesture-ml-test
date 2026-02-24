@@ -1,10 +1,15 @@
-New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Force
-Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name EnableScriptBlockLogging -Value 1
+A:
+cls
+$command = "Get-Service"
+$bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
+$encoded = [Convert]::ToBase64String($bytes)
+$encoded
 
 
-powershell -EncodedCommand VwByAGkAdABlAC0ASABvAHMAdAAgACcAVABlAHMAdAAgAEUAbgBjAG8AZABlAGQAJwA=
+powershell.exe -EncodedCommand RwBlAHQALQBTAGUAcgB2AGkAYwBlAA==
 
-Get-WinEvent -FilterHashtable @{LogName="Security"; Id=4688} -MaxEvents 50 |
-Where-Object { $_.Message -match "powershell" } |
-Select TimeCreated, Id, Message |
-Format-Table -Wrap
+B:
+[System.Text.Encoding]::Unicode.GetString(
+[Convert]::FromBase64String("VwByAGkAdABlAC0ASABvAHMAdAAgACcAVwBlAGwAYwBvAG0AZQAgAHQAbwAgAFAAcgBvAGoAZQBjAHQAIAA1ACcA"))
+
+Write-Host 'Welcome to Project 5'
